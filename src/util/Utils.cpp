@@ -42,6 +42,7 @@ int jasminegraph_profile = PROFILE_K8S;
 #endif
 
 unordered_map<std::string, std::string> Utils::propertiesMap;
+std::mutex Utils::sqliteMutex;
 
 std::vector<std::string> Utils::split(const std::string &s, char delimiter) {
     std::vector<std::string> tokens;
@@ -259,10 +260,23 @@ std::vector<std::string> Utils::getListOfFilesInDirectory(std::string dirName) {
 int Utils::deleteDirectory(const std::string dirName) {
     string command = "rm -rf " + dirName;
     int status = system(command.c_str());
-    if (status == 0)
+    if (status == 0) {
         util_logger.info(dirName + " deleted successfully");
-    else
+    } else {
         util_logger.warn("Deleting " + dirName + " failed with exit code " + std::to_string(status));
+    }
+    return status;
+}
+
+int Utils::deleteAllMatchingFiles(const std::string fileNamePattern) {
+    std::string command = "rm -f " + fileNamePattern + "*";
+    int status = system(command.c_str());
+    if (status == 0) {
+        util_logger.info("Deleted All files associated with: " + fileNamePattern + "* successfully");
+    } else {
+        util_logger.warn("Deleting files associated with: " + fileNamePattern
+                         + "* failed with exit code " + std::to_string(status));
+    }
     return status;
 }
 
@@ -1197,157 +1211,46 @@ bool Utils::transferPartition(std::string sourceWorker, int sourceWorkerPort, st
     return true;
 }
 
-bool Utils::sendQueryPlanToWorker(std::string host, int port, std::string masterIP,
-                                  int graphID, int partitionId, std::string message, SharedBuffer &sharedBuffer){
-    util_logger.info("Host:" + host + " Port:" + to_string(port));
-    bool result = true;
-    int sockfd;
-    char data[FED_DATA_LENGTH + 1];
-    static const int ACK_MESSAGE_SIZE = 1024;
-    struct sockaddr_in serv_addr;
-    struct hostent *server;
+void Utils::assignPartitionToWorker(int graphId, int partitionIndex, string  hostname, int port) {
+    util_logger.debug("Assigning graph ID: " + std::to_string(graphId) + "  partition: "
+    + std::to_string(partitionIndex) + " to worker");
 
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    auto *sqlite = new SQLiteDBInterface();
+    sqlite->init();
 
-    if (sockfd < 0) {
-        util_logger.error("Cannot create socket");
-        return false;
+    string workerHost;
+    if (hostname.find('@') != std::string::npos) {
+        workerHost = Utils::split(hostname, '@')[1];
     }
 
-    if (host.find('@') != std::string::npos) {
-        host = Utils::split(host, '@')[1];
-    }
+    sqliteMutex.lock();
 
-    server = gethostbyname(host.c_str());
-    if (server == NULL) {
-        util_logger.error("ERROR, no host named " + host);
-        return false;
-    }
+    try {
+        std::string workerSearchQuery =
+                "SELECT idworker FROM worker WHERE ip='" + workerHost +
+                "' AND server_port='" + std::to_string(port) + "'";
 
-    bzero((char *)&serv_addr, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    bcopy((char *)server->h_addr, (char *)&serv_addr.sin_addr.s_addr, server->h_length);
-    serv_addr.sin_port = htons(port);
-    if (Utils::connect_wrapper(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        return false;
-    }
+        std::vector<std::vector<std::pair<std::string, std::string>>> results = sqlite->runSelect(workerSearchQuery);
 
-    if (!Utils::performHandshake(sockfd, data, FED_DATA_LENGTH, masterIP)) {
-        Utils::send_str_wrapper(sockfd, JasmineGraphInstanceProtocol::CLOSE);
-        close(sockfd);
-        return false;
-    }
-
-    if (!Utils::sendExpectResponse(sockfd, data, INSTANCE_DATA_LENGTH,
-                                   JasmineGraphInstanceProtocol::QUERY_START,
-                                   JasmineGraphInstanceProtocol::QUERY_START_ACK)) {
-        Utils::send_str_wrapper(sockfd, JasmineGraphInstanceProtocol::CLOSE);
-        close(sockfd);
-        return false;
-    }
-    char ack1[ACK_MESSAGE_SIZE] = {0};
-    int message_length = std::to_string(graphID).length();
-    int converted_number = htonl(message_length);
-    util_logger.info("Sending content length: "+ to_string(converted_number));
-    if (!Utils::sendIntExpectResponse(sockfd, ack1,
-                                      JasmineGraphInstanceProtocol::GRAPH_STREAM_C_length_ACK.length(),
-                                   converted_number,
-                                   JasmineGraphInstanceProtocol::GRAPH_STREAM_C_length_ACK)) {
-        Utils::send_str_wrapper(sockfd, JasmineGraphInstanceProtocol::CLOSE);
-        close(sockfd);
-        return false;
-    }
-
-    if(!Utils::send_str_wrapper(sockfd, to_string(graphID))) {
-        close(sockfd);
-        return false;
-    }
-
-    char ack2[ACK_MESSAGE_SIZE] = {0};
-    message_length = std::to_string(partitionId).length();
-    converted_number = htonl(message_length);
-    util_logger.info("Sending content length: "+to_string(converted_number));
-
-    if (!Utils::sendIntExpectResponse(sockfd, ack2,
-                                      JasmineGraphInstanceProtocol::GRAPH_STREAM_C_length_ACK.length(),
-                                      converted_number,
-                                      JasmineGraphInstanceProtocol::GRAPH_STREAM_C_length_ACK)) {
-        Utils::send_str_wrapper(sockfd, JasmineGraphInstanceProtocol::CLOSE);
-        close(sockfd);
-        return false;
-    }
-
-    if(!Utils::send_str_wrapper(sockfd, to_string(partitionId))) {
-        close(sockfd);
-        return false;
-    }
-
-    char ack3[ACK_MESSAGE_SIZE] = {0};
-    message_length = message.length();
-    converted_number = htonl(message_length);
-    util_logger.info("Sending content length: "+to_string(converted_number));
-
-    if (!Utils::sendIntExpectResponse(sockfd, ack3,
-                                      JasmineGraphInstanceProtocol::GRAPH_STREAM_C_length_ACK.length(),
-                                      converted_number,
-                                      JasmineGraphInstanceProtocol::GRAPH_STREAM_C_length_ACK)) {
-        Utils::send_str_wrapper(sockfd, JasmineGraphInstanceProtocol::CLOSE);
-        close(sockfd);
-        return false;
-    }
-
-    if(!Utils::send_str_wrapper(sockfd, message)) {
-        close(sockfd);
-        return false;
-    }
-
-    while(true){
-        char start[ACK_MESSAGE_SIZE] = {0};
-        recv(sockfd, &start, sizeof(start), 0);
-        std::string start_msg(start);
-        if (JasmineGraphInstanceProtocol::QUERY_DATA_START != start_msg) {
-            util_logger.error("Error while receiving start command ack : "+ start_msg);
-            continue;
+        if (results.empty()) {
+            util_logger.error("Worker not found : " + workerHost);
+            throw std::runtime_error("Worker not found");
         }
-        util_logger.info(start);
-        send(sockfd, JasmineGraphInstanceProtocol::QUERY_DATA_ACK.c_str(),
-             JasmineGraphInstanceProtocol::QUERY_DATA_ACK.length(), 0);
 
-        int content_length;
-        ssize_t return_status = recv(sockfd, &content_length, sizeof(int), 0);
-        if (return_status > 0) {
-            content_length = ntohl(content_length);
-            util_logger.info("Received int =" + std::to_string(content_length));
-        } else {
-            util_logger.error("Error while receiving content length");
-            return false;
-        }
-        send(sockfd, JasmineGraphInstanceProtocol::GRAPH_STREAM_C_length_ACK.c_str(),
-             JasmineGraphInstanceProtocol::GRAPH_STREAM_C_length_ACK.length(), 0);
+        std::string workerID = results[0][0].second;
 
-        std::string data(content_length, 0);
-        return_status = recv(sockfd, &data[0], content_length, 0);
-        if (return_status > 0) {
-            util_logger.info("Received graph data: ");
-            send(sockfd, JasmineGraphInstanceProtocol::GRAPH_DATA_SUCCESS.c_str(),
-                 JasmineGraphInstanceProtocol::GRAPH_DATA_SUCCESS.length(), 0);
-        } else {
-            util_logger.info("Error while reading graph data");
-            return false;
-        }
-        if(data == "-1"){
-            break;
-        }
-//        auto str = json::parse(data);
-//        std::ostringstream row;
-//        row << "| " << std::left
-//            << std::setw(10) << str.value("id", "-")
-//            << "| " << std::setw(30) << str.value("name", "-")
-//            << "| " << std::setw(30) << str.value("occupation", str.value("category", "-"))
-//            << "| " << std::setw(10) << str.value("type", "-")
-//            << "|";
-        sharedBuffer.add(data);
+        std::string partitionToWorkerQuery =
+                "INSERT INTO worker_has_partition (partition_idpartition, partition_graph_idgraph, worker_idworker) "
+                "VALUES ('" + std::to_string(partitionIndex) + "','" + std::to_string(graphId)
+                + "','" + workerID + "')";
+
+        sqlite->runInsert(partitionToWorkerQuery);
+    } catch (const std::exception &ex) {
+        util_logger.error("Error assigning partition to worker: " + std::string(ex.what()));
     }
 
-    return true;
+    sqlite->finalize();
+    sqliteMutex.unlock();
+
+    delete sqlite;
 }
