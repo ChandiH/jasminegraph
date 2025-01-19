@@ -489,22 +489,21 @@ static void cypher_ast_command(int connFd, vector<DataPublisher *> &workerClient
     JasmineGraphServer *server = JasmineGraphServer::getInstance();
     server->sendQueryPlan(stoi(user_res_1), workerClients.size(), obj, std::ref(sharedBuffer));
 
-//    std::ostringstream header;
-//    header << "| " << std::left << std::setw(10) << "ID"
-//           << "| " << std::setw(30) << "Name"
-//           << "| " << std::setw(30) << "Occupation/Category"
-//           << "| " << std::setw(10) << "Type" << "|";
-//    result_wr = write(connFd, header.str().c_str(), header.str().length());
-//    result_wr = write(connFd, "\r\n", 2);
-//    result_wr = write(connFd, std::string(90, '-').c_str(), std::string(90, '-').length());
-//    result_wr = write(connFd, "\r\n", 2);
+    int closeFlag = 0;
+
     while(true){
-        std::string data = sharedBuffer.get();
-        if(data == "-1"){
+        if(closeFlag == numberOfPartitions) {
             break;
         }
-        result_wr = write(connFd, data.c_str(), data.length());
-        result_wr = write(connFd, "\r\n", 2);
+        std::string data = sharedBuffer.get();
+        if (data == "-1")
+        {
+            closeFlag++;
+        }else
+        {
+            result_wr = write(connFd, data.c_str(), data.length());
+            result_wr = write(connFd, "\r\n", 2);
+        }
     }
 }
 
