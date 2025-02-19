@@ -65,6 +65,7 @@ static void remove_graph_command(std::string masterIP,
 static void triangles_command(std::string masterIP,
     int connFd, SQLiteDBInterface *sqlite, PerformanceSQLiteDBInterface *perfSqlite,
     JobScheduler *jobScheduler, bool *loop_exit_p, std::string command);
+static void get_degree_command(int connFd, std::string command, int numberOfPartition, std::string type, bool *loop_exit_p);
 
 void *uifrontendservicesesion(void *dummyPt) {
     frontendservicesessionargs *sessionargs = (frontendservicesessionargs *)dummyPt;
@@ -83,6 +84,8 @@ void *uifrontendservicesesion(void *dummyPt) {
     char data[FRONTEND_DATA_LENGTH + 1];
     //  Initiate Thread
     thread input_stream_handler;
+    std::string partitionCount = Utils::getJasmineGraphProperty("org.jasminegraph.server.npartitions");
+    int numberOfPartitions = std::stoi(partitionCount);
 
     bool loop_exit = false;
     int failCnt = 0;
@@ -119,6 +122,10 @@ void *uifrontendservicesesion(void *dummyPt) {
             triangles_command(masterIP, connFd, sqlite, perfSqlite, jobScheduler, &loop_exit, line);
         } else if (token.compare(RMGR) == 0) {
             remove_graph_command(masterIP, connFd, sqlite, &loop_exit, line);
+        } else if (token.compare(IN_DEGREE) == 0) {
+            get_degree_command(connFd, line, numberOfPartitions, "_idd_",  &loop_exit);
+        } else if (token.compare(OUT_DEGREE) == 0) {
+            get_degree_command(connFd, line, numberOfPartitions, "_odd_",  &loop_exit);
         } else {
             ui_frontend_logger.error("Message format not recognized " + line);
             int result_wr = write(connFd, INVALID_FORMAT.c_str(), INVALID_FORMAT.size());
@@ -286,6 +293,11 @@ static void list_command(int connFd, SQLiteDBInterface *sqlite, bool *loop_exit_
             ui_frontend_logger.error("Error writing to socket");
             *loop_exit_p = true;
         }
+    }
+    int result_wr = write(connFd, "\r\n", 2);
+    if (result_wr < 0) {
+        ui_frontend_logger.error("Error writing to socket");
+        *loop_exit_p = true;
     }
 }
 
@@ -582,5 +594,86 @@ static void triangles_command(std::string masterIP, int connFd,
             ui_frontend_logger.error("Error writing to socket");
             *loop_exit_p = true;
         }
+    }
+}
+
+static void get_degree_command(int connFd, std::string command, int numberOfPartition, std::string type, bool *loop_exit_p)
+{
+    char delimiter = '|';
+    std::stringstream ss(command);
+    std::string token;
+    std::string graph_id;
+
+    std::getline(ss, token, delimiter);
+    std::getline(ss, graph_id, delimiter);
+
+    string graphID(graph_id);
+
+    graphID = Utils::trim_copy(graphID);
+    ui_frontend_logger.info("Graph ID received: " + graphID);
+
+    JasmineGraphServer::inDegreeDistribution(graphID);
+    string instanceDataFolderLocation = Utils::getJasmineGraphProperty("org.jasminegraph.server.instance.datafolder");
+
+    ui_frontend_logger.info("instance data folder location" + instanceDataFolderLocation);
+    for (int partitionId=0; partitionId<numberOfPartition; partitionId++)
+    {
+        string attributeFilePath = instanceDataFolderLocation + "/" + graphID + type + std::to_string(partitionId);
+
+        // Create an input file stream object
+        std::ifstream inputFile(attributeFilePath);
+
+        // Check if the file was opened successfully
+        if (!inputFile.is_open()) {
+            ui_frontend_logger.error("Error: Could not open the file '" + attributeFilePath + "'");
+            continue;
+        }
+
+        // Read the file line by line and print to the console
+        std::string line;
+        while (std::getline(inputFile, line)) {
+            std::istringstream iss(line);
+            std::string num1, num2;
+
+            // Split the line by tab
+            if (std::getline(iss, num1, '\t') && std::getline(iss, num2, '\t')) {
+                json point;
+                point["node"] = num1;
+                point["value"] = num2;
+
+                // Convert JSON object to string and log it
+                string result = point.dump();
+                // Write the result to the socket
+                if (result.size() > 0) {
+                    int result_wr = write(connFd, result.c_str(), result.length());
+                    if (result_wr < 0) {
+                        ui_frontend_logger.error("Error writing to socket");
+                        *loop_exit_p = true;
+                    }
+                    result_wr = write(connFd, "\r\n", 2);
+                    if (result_wr < 0) {
+                        ui_frontend_logger.error("Error writing to socket");
+                        *loop_exit_p = true;
+                    }
+                }
+            } else {
+                ui_frontend_logger.error("Error: Malformed line: " + line);
+            }
+        }
+
+        // Close the file
+        inputFile.close();
+    }
+
+    int result_wr = write(connFd, "-1", 2);
+    if (result_wr < 0) {
+        ui_frontend_logger.error("Error writing to socket");
+        *loop_exit_p = true;
+        return;
+    }
+    result_wr = write(connFd, "\r\n", 2);
+    if (result_wr < 0) {
+        ui_frontend_logger.error("Error writing to socket");
+        *loop_exit_p = true;
     }
 }
