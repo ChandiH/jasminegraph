@@ -42,6 +42,22 @@ limitations under the License.
 #include "../core/common/JasmineGraphFrontendCommon.h"
 #include "../core/scheduler/JobScheduler.h"
 
+#include "../../partitioner/local/RDFParser.h"
+#include "../../util/kafka/StreamHandler.h"
+#include "../JasmineGraphFrontEndProtocol.h"
+#include "antlr4-runtime.h"
+#include "/home/ubuntu/software/antlr/CypherLexer.h"
+#include "/home/ubuntu/software/antlr/CypherParser.h"
+#include "../../query/processor/cypher/astbuilder/ASTBuilder.h"
+#include "../../query/processor/cypher/astbuilder/ASTNode.h"
+#include "../../query/processor/cypher/semanticanalyzer/SemanticAnalyzer.h"
+#include "../../query/processor/cypher/queryplanner/Operators.h"
+#include "../../query/processor/cypher/queryplanner/QueryPlanner.h"
+#include "../../localstore/incremental/JasmineGraphIncrementalLocalStore.h"
+#include "../../server/JasmineGraphInstanceService.h"
+#include "../../query/processor/cypher/runtime/QueryPlanHandler.h"
+#include "../../query/processor/cypher/util/SharedBuffer.h"
+
 #define MAX_PENDING_CONNECTIONS 10
 #define DATA_BUFFER_SIZE (FRONTEND_DATA_LENGTH + 1)
 
@@ -66,6 +82,21 @@ static void triangles_command(std::string masterIP,
     int connFd, SQLiteDBInterface *sqlite, PerformanceSQLiteDBInterface *perfSqlite,
     JobScheduler *jobScheduler, bool *loop_exit_p, std::string command);
 static void get_degree_command(int connFd, std::string command, int numberOfPartition, std::string type, bool *loop_exit_p);
+static void cypher_ast_command(int connFd, vector<DataPublisher *> &workerClients,
+                               int numberOfPartitions, bool *loop_exit, std::string command);
+
+static vector<DataPublisher *> getWorkerClients(SQLiteDBInterface *sqlite) {
+    const vector<Utils::worker> &workerList = Utils::getWorkerList(sqlite);
+    vector<DataPublisher *> workerClients;
+    for (int i = 0; i < workerList.size(); i++) {
+        Utils::worker currentWorker = workerList.at(i);
+        string workerHost = currentWorker.hostname;
+        int workerPort = atoi(string(currentWorker.port).c_str());
+        DataPublisher *workerClient = new DataPublisher(workerPort, workerHost);
+        workerClients.push_back(workerClient);
+    }
+    return workerClients;
+}
 
 void *uifrontendservicesesion(void *dummyPt) {
     frontendservicesessionargs *sessionargs = (frontendservicesessionargs *)dummyPt;
@@ -84,8 +115,16 @@ void *uifrontendservicesesion(void *dummyPt) {
     char data[FRONTEND_DATA_LENGTH + 1];
     //  Initiate Thread
     thread input_stream_handler;
+    //  Initiate kafka consumer parameters
     std::string partitionCount = Utils::getJasmineGraphProperty("org.jasminegraph.server.npartitions");
     int numberOfPartitions = std::stoi(partitionCount);
+    std::string kafka_server_IP;
+    cppkafka::Configuration configs;
+    KafkaConnector *kstream;
+    Partitioner graphPartitioner(numberOfPartitions, 1, spt::Algorithms::HASH, sqlite);
+
+    vector<DataPublisher *> workerClients;
+    bool workerClientsInitialized = false;
 
     bool loop_exit = false;
     int failCnt = 0;
@@ -126,6 +165,10 @@ void *uifrontendservicesesion(void *dummyPt) {
             get_degree_command(connFd, line, numberOfPartitions, "_idd_",  &loop_exit);
         } else if (token.compare(OUT_DEGREE) == 0) {
             get_degree_command(connFd, line, numberOfPartitions, "_odd_",  &loop_exit);
+        } else if (token.compare(CYPHER_AST) == 0){
+            workerClients = getWorkerClients(sqlite);
+            workerClientsInitialized = true;
+            cypher_ast_command(connFd, workerClients, numberOfPartitions, &loop_exit, line);
         } else {
             ui_frontend_logger.error("Message format not recognized " + line);
             int result_wr = write(connFd, INVALID_FORMAT.c_str(), INVALID_FORMAT.size());
@@ -289,6 +332,7 @@ static void list_command(int connFd, SQLiteDBInterface *sqlite, bool *loop_exit_
         }
     } else {
         int result_wr = write(connFd, result.c_str(), result.length());
+        write(connFd, "\r\n", 2);
         if (result_wr < 0) {
             ui_frontend_logger.error("Error writing to socket");
             *loop_exit_p = true;
@@ -677,3 +721,69 @@ static void get_degree_command(int connFd, std::string command, int numberOfPart
         *loop_exit_p = true;
     }
 }
+
+static void cypher_ast_command(int connFd, vector<DataPublisher *> &workerClients,
+                               int numberOfPartitions, bool *loop_exit, std::string command)
+{
+    char delimiter = '|';
+    std::stringstream ss(command);
+    std::string token;
+    std::string graph_id;
+    std::string query;
+
+    std::getline(ss, token, delimiter);
+    std::getline(ss, graph_id, delimiter);
+    std::getline(ss, query, delimiter);
+
+    ui_frontend_logger.info("recieved graph id: " + graph_id);
+    ui_frontend_logger.info("query: " + query);
+
+    string user_res_1(graph_id);
+    string user_res_s(query);
+
+    antlr4::ANTLRInputStream input(user_res_s);
+    // Create a lexer from the input
+    CypherLexer lexer(&input);
+
+    // Create a token stream from the lexer
+    antlr4::CommonTokenStream tokens(&lexer);
+
+    // Create a parser from the token stream
+    CypherParser parser(&tokens);
+
+    ASTBuilder ast_builder;
+    auto* ast = any_cast<ASTNode*>(ast_builder.visitOC_Cypher(parser.oC_Cypher()));
+
+    SemanticAnalyzer semantic_analyzer;
+    string obj;
+    if (semantic_analyzer.analyze(ast)) {
+        ui_frontend_logger.log("AST is successfully analyzed", "log");
+        QueryPlanner query_planner;
+        Operator *opr = query_planner.createExecutionPlan(ast);
+        obj = opr->execute();
+    } else {
+        ui_frontend_logger.error("query isn't semantically correct: "+user_res_s);
+    }
+    SharedBuffer sharedBuffer(3);
+    JasmineGraphServer *server = JasmineGraphServer::getInstance();
+    server->sendQueryPlan(stoi(user_res_1), workerClients.size(), obj, std::ref(sharedBuffer));
+
+    int closeFlag = 0;
+
+    while(true){
+        if(closeFlag == numberOfPartitions) {
+            write(connFd, "-1", 2);
+            break;
+        }
+        std::string data = sharedBuffer.get();
+        if (data == "-1")
+        {
+            closeFlag++;
+        }else
+        {
+            write(connFd, data.c_str(), data.length());
+            write(connFd, "\r\n", 2);
+        }
+    }
+}
+

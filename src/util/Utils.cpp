@@ -631,7 +631,33 @@ bool Utils::send_wrapper(int connFd, const char *buf, size_t size) {
     return true;
 }
 
-bool Utils::send_str_wrapper(int connFd, std::string str) { return send_wrapper(connFd, str.c_str(), str.length()); }
+bool Utils::send_str_wrapper(int connFd, std::string str) {
+    return send_wrapper(connFd, str.c_str(), str.length());
+}
+
+bool Utils::send_int_wrapper(int connFd, int *value, size_t datalength) {
+    ssize_t sz = send(connFd, value, datalength, 0);
+    if (sz < datalength) {
+        util_logger.error("Send failed");
+        return false;
+    }
+    return true;
+}
+
+bool Utils::sendIntExpectResponse(int sockfd, char *data, size_t data_length,
+                                  int value, std::string expectMsg) {
+    if (!Utils::send_int_wrapper(sockfd, &value, sizeof(value))) {
+        return false;
+    }
+    util_logger.info("Sent: " + to_string(value));
+    std::string response = Utils::read_str_trim_wrapper(sockfd, data, data_length);
+    if (response.compare(expectMsg) != 0) {
+        util_logger.error("Incorrect response. Expected: " + expectMsg + " ; Received: " + response);
+        return false;
+    }
+    util_logger.info("Received: " + response);
+    return true;
+}
 
 bool Utils::sendExpectResponse(int sockfd, char *data, size_t data_length, std::string sendMsg, std::string expectMsg) {
     if (!Utils::send_str_wrapper(sockfd, sendMsg)) {
